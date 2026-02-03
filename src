@@ -1,0 +1,123 @@
+import pandas as pd
+import numpy as np
+import io
+from google.colab import files
+
+# ==============================================================================
+# 1. File Upload
+# ==============================================================================
+print("▶ Click the [Choose Files] button below to upload your CSV file.")
+uploaded = files.upload()
+filename = list(uploaded.keys())[0]
+
+# ==============================================================================
+# 2. Data Loading
+# ==============================================================================
+try:
+    df = pd.read_csv(io.BytesIO(uploaded[filename]), encoding='utf-8')
+except:
+    try:
+        df = pd.read_csv(io.BytesIO(uploaded[filename]), encoding='cp949')
+    except:
+        df = pd.read_csv(io.BytesIO(uploaded[filename]), encoding='euc-kr')
+
+df.columns = ['Time', 'RH', 'Temp']
+df['Time'] = pd.to_datetime(df['Time'])
+df['Temp'] = df['Temp'].interpolate().ffill().bfill()
+df['RH'] = df['RH'].interpolate().ffill().bfill()
+
+# ==============================================================================
+# 3. Simulation Setup (Radius = 5.0m)
+# ==============================================================================
+# Physical Constants
+rho = 650.0       # Bulk Density
+cp = 1500.0       # Specific Heat Capacity
+k_reaction = 0.5  # Reaction Rate Constant
+
+# [KEY CHANGE] Radius set to 5.0 meters
+radius = 5.0      
+U_eff = 0.15 / radius      # Decreases as R increases (Heat trapped more)
+Area_Vol = 3.0 / radius    # Decreases as R increases (Less surface area)
+
+# Initial Conditions
+current_T = df['Temp'].iloc[0]
+current_M = 0.06           # Fixed Initial Moisture 6%
+
+print(f"\n[Settings Check] Radius: {radius} m (Changed!)")
+print(f"                 Initial Temp: {current_T} C / Initial Moisture: {current_M*100}%")
+
+# Arrays
+n = len(df)
+T_pile = np.zeros(n)
+M_pile = np.zeros(n)
+Q_net = np.zeros(n)
+
+T_pile[0], M_pile[0] = current_T, current_M
+
+# Sub-stepping
+sub_steps = 60
+dt_sub = 1.0 / sub_steps
+
+# EMC Function
+def calculate_emc(T, RH):
+    h = np.clip(RH/100.0, 0.01, 0.99)
+    W = 349 + 1.29*T + 0.0135*T**2
+    K = 0.805 + 0.000736*T - 0.00000273*T**2
+    K1 = 6.27 - 0.00938*T - 0.000303*T**2
+    K2 = 1.91 + 0.0407*T - 0.000293*T**2
+    term1 = (K * h) / (1 - K * h)
+    term2 = (K1 * K * h + 2 * K1 * K2 * K**2 * h**2) / (1 + K1 * K * h + K1 * K2 * K**2 * h**2)
+    return (1800 / W) * (term1 + term2) / 100.0
+
+print("Simulation in progress... (Radius 5m takes same time)")
+
+# ==============================================================================
+# 4. Simulation Loop
+# ==============================================================================
+for i in range(1, n):
+    T_env = df['Temp'].iloc[i]
+    RH_env = df['RH'].iloc[i]
+    q_accum = 0
+    
+    for _ in range(sub_steps):
+        Psat_env = 610.94 * np.exp((17.625 * T_env)/(T_env + 243.04))
+        Pv_env = Psat_env * (RH_env / 100.0)
+        Psat_pile = 610.94 * np.exp((17.625 * current_T)/(current_T + 243.04))
+        RH_pore = np.clip((Pv_env / Psat_pile) * 100.0, 0, 99.9)
+        
+        target_emc = calculate_emc(current_T, RH_pore)
+        dM = k_reaction * (target_emc - current_M) * dt_sub
+        current_M += dM
+        
+        Heat_Coeff = (2501 - 2.37*current_T + 1215*np.exp(-15*current_M)) * 1000
+        q_gen = rho * dM * Heat_Coeff / (dt_sub * 3600)
+        q_loss = U_eff * Area_Vol * (current_T - T_env)
+        
+        q_net_inst = q_gen - q_loss
+        q_accum += q_net_inst
+        
+        current_T += (q_net_inst * (dt_sub * 3600)) / (rho * cp)
+        
+    T_pile[i] = current_T
+    M_pile[i] = current_M
+    Q_net[i] = q_accum / sub_steps
+
+# ==============================================================================
+# 5. Save Results (New Filename)
+# ==============================================================================
+result_df = pd.DataFrame({
+    'Time': df['Time'],
+    'Ambient_Temp': df['Temp'],
+    'Ambient_RH': df['RH'],
+    'Pile_Temp': T_pile,
+    'Pile_Moisture': M_pile,
+    'Net_Heat_Flux_W_m3': Q_net
+})
+
+# 파일 이름을 변경하여 이전 파일과 섞이지 않게 함
+output_filename = "final_result_radius_5m.csv"
+result_df.to_csv(output_filename, index=False, encoding='utf-8-sig')
+
+print(f"\n[Done] Results saved to '{output_filename}'.")
+print(f"Max Temp: {np.max(T_pile):.2f} C") # 결과 확인용 출력
+files.download(output_filename)
